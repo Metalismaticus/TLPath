@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿using System;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 
@@ -9,9 +9,6 @@ namespace NavMod
         ICoreClientAPI capi;
         CompassRibbonRenderer compass;
         TlPathService svc;
-
-        // локальное состояние idle-компаса
-        bool idleVisible = false;
 
         public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Client;
 
@@ -24,9 +21,6 @@ namespace NavMod
 
             var datadir = System.IO.Path.Combine(capi.GetOrCreateDataPath("tlpath"), "client");
             svc = new TlPathService(capi, datadir, compass);
-
-            // начальное состояние idle-показа
-            compass.SetIdleVisible(idleVisible);
 
             capi.RegisterCommand("tlpath", "Navigate via TL", "",
                 (int groupId, CmdArgs args) =>
@@ -83,10 +77,8 @@ namespace NavMod
 
                         case "show":
                         {
-                            // .tlpath show — toggle idle compass visibility
-                            idleVisible = !idleVisible;
-                            compass.SetIdleVisible(idleVisible);
-                            capi.ShowChatMessage($"[tl] idle compass: {(idleVisible ? "on" : "off")}");
+                            // .tlpath show — toggle idle compass visibility (delegated to service)
+                            svc.CmdShow();
                             return;
                         }
 

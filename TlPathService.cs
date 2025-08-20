@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -60,17 +60,19 @@ namespace NavMod
             public double WalkRadiusHud { get; set; } = 3000;
             public double FinishDirectHud { get; set; } = 150;
 
-            // NEW: show ribbon when idle (no route)
+            // показывать пустой компас при отсутствии маршрута
             public bool ShowCompassIdle { get; set; } = false;
         }
         Cfg cfg = new Cfg();
 
         public double WalkRadius => cfg.WalkRadiusHud;
+
         public void SetWalkRadius(double r)
         {
             cfg.WalkRadiusHud = GameMath.Clamp(r, 1, 50000);
             SaveCfg();
         }
+
         public void SetRemoteUrl(string url)
         {
             if (string.IsNullOrWhiteSpace(url))
@@ -82,20 +84,15 @@ namespace NavMod
             SaveCfg();
             capi.ShowChatMessage("[tl] GeoJSON link set to: " + cfg.RemoteUrl);
         }
+
         public string GetRemoteUrl() => cfg.RemoteUrl;
 
-        // NEW: .tlpath show command entry (toggle / on / off)
+        // .tlpath show  — toggle/on/off
         public void CmdShow(string arg = null)
         {
             bool? wanted = ParseBoolLoose(arg);
-            if (wanted.HasValue)
-            {
-                cfg.ShowCompassIdle = wanted.Value;
-            }
-            else
-            {
-                cfg.ShowCompassIdle = !cfg.ShowCompassIdle; // toggle if no arg
-            }
+            if (wanted.HasValue) cfg.ShowCompassIdle = wanted.Value;
+            else cfg.ShowCompassIdle = !cfg.ShowCompassIdle;
 
             SaveCfg();
             ApplyIdleFlagToCompass();
@@ -117,16 +114,8 @@ namespace NavMod
 
         void ApplyIdleFlagToCompass()
         {
-            // Метод будет реализован в CompassRibbonRenderer на следующем шаге
-            // Должен просто включать/выключать показ пустого компаса.
-            try
-            {
-                compass?.SetIdleVisible(cfg.ShowCompassIdle);
-            }
-            catch
-            {
-                // На случай, если старая версия рендерера без метода — тихо игнорируем.
-            }
+            try { compass?.SetIdleVisible(cfg.ShowCompassIdle); }
+            catch { /* старая версия рендерера — молча игнор */ }
         }
 
         void LoadCfg()
@@ -138,6 +127,7 @@ namespace NavMod
             }
             catch { cfg = new Cfg(); }
         }
+
         void SaveCfg()
         {
             File.WriteAllText(cfgPath, JsonSerializer.Serialize(cfg, new JsonSerializerOptions { WriteIndented = true }), Encoding.UTF8);
@@ -174,6 +164,7 @@ namespace NavMod
             var age = DateTime.UtcNow - File.GetLastWriteTimeUtc(geoPath);
             return age.TotalHours > Math.Max(1, cfg.TtlHours);
         }
+
         bool RefreshFromRemote()
         {
             try
@@ -223,7 +214,7 @@ namespace NavMod
         {
             public readonly List<Vec3d> Nodes = new List<Vec3d>();
             public readonly List<List<(int to, double w)>> Adj = new List<List<(int, double)>>();
-            // explicit TL-edge registry to avoid weight heuristics
+            // explicit TL-edge registry to avoid “weight≈3” heuristics
             public readonly HashSet<(int a, int b)> Tele = new HashSet<(int, int)>();
 
             public int AddNode(Vec3d p)
@@ -305,7 +296,7 @@ namespace NavMod
 
                 int ia = GetOrAdd(va);
                 int ib = GetOrAdd(vb);
-                if (ia != ib) g.AddTeleportEdge(ia, ib);
+                if (ia != ib) g.AddTeleportEdge(ia, ib); // TL = 3s + explicit flag
             }
 
             // dedup by min weight (keeps 3.0 for TL)
@@ -477,7 +468,7 @@ namespace NavMod
                 {
                     capi.ShowChatMessage("[tl] Destination close, going direct.");
                     var oneAbs = HudToAbs3(goalHud.X, goalHud.Y, goalHud.Z);
-                    compass.SetRoute3(new List<Vec3d> { oneAbs }, new List<bool>());
+                    compass?.SetRoute3(new List<Vec3d> { oneAbs }, new List<bool>());
                     return;
                 }
 
@@ -506,7 +497,7 @@ namespace NavMod
                 {
                     capi.ShowChatMessage("[tl] route not found. Going direct.");
                     var oneAbs = HudToAbs3(goalHud.X, goalHud.Y, goalHud.Z);
-                    compass.SetRoute3(new List<Vec3d> { oneAbs }, new List<bool>());
+                    compass?.SetRoute3(new List<Vec3d> { oneAbs }, new List<bool>());
                     return;
                 }
 
@@ -540,7 +531,7 @@ namespace NavMod
                 {
                     capi.ShowChatMessage("[tl] route degenerated after TL-clean. Going direct.");
                     var oneAbs = HudToAbs3(goalHud.X, goalHud.Y, goalHud.Z);
-                    compass.SetRoute3(new List<Vec3d> { oneAbs }, new List<bool>());
+                    compass?.SetRoute3(new List<Vec3d> { oneAbs }, new List<bool>());
                     return;
                 }
 
@@ -557,10 +548,17 @@ namespace NavMod
                     bool isTL = g.IsTeleport(a, b);
                     tlFlags.Add(isTL);
                     if (isTL) tp++;
-                    var edge = g.Adj[a].First(e => e.to == b);
-                    if (!isTL) walkSec += edge.w;
+
+                    // безопасно берём вес: без Exception при расхождении
+                    var edge = g.Adj[a].FirstOrDefault(e => e.to == b);
+                    if (!isTL)
+                    {
+                        if (edge.to == b) walkSec += edge.w;
+                        else walkSec += WalkTime(g.Nodes[a], g.Nodes[b]); // редкая защита
+                    }
                 }
 
+                // safety: align sizes for renderer
                 if (tlFlags.Count != Math.Max(0, absPoints.Count - 1))
                 {
                     tlFlags = new List<bool>();
@@ -573,7 +571,7 @@ namespace NavMod
                 double walkMin  = walkSec  / 60.0;
                 capi.ShowChatMessage($"[tl] ETA ≈ {totalMin:0.#} min ({tp} TL, {walkMin:0.#} min walking)");
 
-                compass.SetRoute3(absPoints, tlFlags);
+                compass?.SetRoute3(absPoints, tlFlags);
             });
         }
 
@@ -581,8 +579,8 @@ namespace NavMod
 
         public void ClearCompass()
         {
-            compass.ClearTargetsQueue();
-            compass.SetTarget(null, null);
+            compass?.ClearTargetsQueue();
+            compass?.SetTarget(null, null);
         }
     }
 }
