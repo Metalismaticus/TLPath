@@ -38,6 +38,9 @@ namespace NavMod
             cfgPath = Path.Combine(dataDir, "config.json");
             geoPath = Path.Combine(dataDir, "translocators.geojson");
             LoadCfg();
+
+            // применяем сохранённый флаг "показывать пустой компас"
+            ApplyIdleFlagToCompass();
         }
 
         // ===== config =====
@@ -56,6 +59,9 @@ namespace NavMod
 
             public double WalkRadiusHud { get; set; } = 3000;
             public double FinishDirectHud { get; set; } = 150;
+
+            // NEW: show ribbon when idle (no route)
+            public bool ShowCompassIdle { get; set; } = false;
         }
         Cfg cfg = new Cfg();
 
@@ -77,6 +83,51 @@ namespace NavMod
             capi.ShowChatMessage("[tl] GeoJSON link set to: " + cfg.RemoteUrl);
         }
         public string GetRemoteUrl() => cfg.RemoteUrl;
+
+        // NEW: .tlpath show command entry (toggle / on / off)
+        public void CmdShow(string arg = null)
+        {
+            bool? wanted = ParseBoolLoose(arg);
+            if (wanted.HasValue)
+            {
+                cfg.ShowCompassIdle = wanted.Value;
+            }
+            else
+            {
+                cfg.ShowCompassIdle = !cfg.ShowCompassIdle; // toggle if no arg
+            }
+
+            SaveCfg();
+            ApplyIdleFlagToCompass();
+
+            capi.ShowChatMessage(cfg.ShowCompassIdle
+                ? "[tl] Compass: idle display ON"
+                : "[tl] Compass: idle display OFF");
+        }
+
+        // helper: "on/off/true/false/1/0" → bool? ; null if unknown/empty
+        bool? ParseBoolLoose(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return null;
+            s = s.Trim().ToLowerInvariant();
+            if (s == "1" || s == "on" || s == "true"  || s == "enable"  || s == "enabled")  return true;
+            if (s == "0" || s == "off"|| s == "false" || s == "disable" || s == "disabled") return false;
+            return null;
+        }
+
+        void ApplyIdleFlagToCompass()
+        {
+            // Метод будет реализован в CompassRibbonRenderer на следующем шаге
+            // Должен просто включать/выключать показ пустого компаса.
+            try
+            {
+                compass?.SetIdleVisible(cfg.ShowCompassIdle);
+            }
+            catch
+            {
+                // На случай, если старая версия рендерера без метода — тихо игнорируем.
+            }
+        }
 
         void LoadCfg()
         {
@@ -172,7 +223,7 @@ namespace NavMod
         {
             public readonly List<Vec3d> Nodes = new List<Vec3d>();
             public readonly List<List<(int to, double w)>> Adj = new List<List<(int, double)>>();
-            // explicit TL-edge registry to avoid “weight≈3” heuristics
+            // explicit TL-edge registry to avoid weight heuristics
             public readonly HashSet<(int a, int b)> Tele = new HashSet<(int, int)>();
 
             public int AddNode(Vec3d p)
@@ -254,7 +305,7 @@ namespace NavMod
 
                 int ia = GetOrAdd(va);
                 int ib = GetOrAdd(vb);
-                if (ia != ib) g.AddTeleportEdge(ia, ib); // TL = 3s + explicit flag
+                if (ia != ib) g.AddTeleportEdge(ia, ib);
             }
 
             // dedup by min weight (keeps 3.0 for TL)
@@ -472,13 +523,12 @@ namespace NavMod
                             int nxt = raw[i + 1];
                             nextIsTL = gg.IsTeleport(cur, nxt);
                         }
-                        // keep node if we will teleport next, or if it is start/goal, or if previous was TL
+                        // keep if start/goal, or adjacent to a TL edge
                         if (i == 0 || i == raw.Count - 1) { outp.Add(cur); continue; }
                         bool prevIsTL = gg.IsTeleport(raw[i - 1], cur);
                         if (nextIsTL || prevIsTL) outp.Add(cur);
                         else
                         {
-                            // drop TL node that we only touch without teleporting
                             bool curHasTLIncident = gg.Adj[cur].Any(e => gg.IsTeleport(cur, e.to));
                             if (!curHasTLIncident) outp.Add(cur);
                         }
@@ -507,15 +557,12 @@ namespace NavMod
                     bool isTL = g.IsTeleport(a, b);
                     tlFlags.Add(isTL);
                     if (isTL) tp++;
-                    // take the actual edge weight from adjacency
                     var edge = g.Adj[a].First(e => e.to == b);
                     if (!isTL) walkSec += edge.w;
                 }
 
-                // safety: align sizes for renderer
                 if (tlFlags.Count != Math.Max(0, absPoints.Count - 1))
                 {
-                    // fallback: mark teleports by geometry distance as last resort
                     tlFlags = new List<bool>();
                     for (int i = 0; i + 1 < hudPoints.Count; i++)
                         tlFlags.Add(Math.Sqrt(Dist2_HUD(hudPoints[i], hudPoints[i + 1])) <= 1.5);

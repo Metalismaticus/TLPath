@@ -12,11 +12,21 @@ namespace NavMod
     ///  - intermediate points: 3D threshold (ReachDistBlocks)
     ///  - final point: 2D HUD threshold (FinalReachHud)
     ///  - TL pair: skip exit node after hitting entry
+    ///  Additionally:
+    ///  - Idle compass: when no route but showCompassIdle=true, draw compass without targets.
+    ///  - Smooth fade/slide animation in/out for idle visibility.
     /// </summary>
     public class CompassRibbonRenderer : IRenderer
     {
         readonly ICoreClientAPI capi;
         public bool Enabled = true;
+
+        // Idle compass
+        bool showCompassIdle = false;
+        float idleAnim01 = 0f; // 0..1
+        const float IdleAnimSpeed = 10f; // higher = faster
+
+        public void SetIdleVisible(bool on) => showCompassIdle = on;
 
         // Current target (ABS) for compass marker
         public double? TargetX = null;
@@ -186,10 +196,8 @@ namespace NavMod
             if (d > threshold) return;
 
             // If current target is the entry of a TL edge, skip exit node too
-            // Entry condition: the NEXT edge (routePos -> routePos+1) is TL
             if (routePos < isTeleportEdge.Count && isTeleportEdge[routePos] == true)
             {
-                // Advance by 2: entry and paired exit
                 AdvanceBy(2);
             }
             else
@@ -205,15 +213,37 @@ namespace NavMod
             if (!Enabled || stage != EnumRenderStage.Ortho) return;
             if (capi?.Render == null || capi.World?.Player?.Entity == null) return;
 
+            // route active?
+            bool hasRoute = routePos < routeHud.Count && hasHudTarget && TargetX.HasValue && TargetZ.HasValue;
+
+            // animate visibility (route OR idle)
+            float target = (hasRoute || showCompassIdle) ? 1f : 0f;
+            // smoothdamp-like exponential lerp
+            float k = 1f - (float)Math.Exp(-IdleAnimSpeed * Math.Clamp(dt, 0f, 0.1f));
+            idleAnim01 = GameMath.Lerp(idleAnim01, target, k);
+
+            if (idleAnim01 <= 0.01f) return; // fully hidden
+
             var pl = capi.World.Player;
             float w = capi.Render.FrameWidth, h = capi.Render.FrameHeight;
 
             float ribbonW = cfg.RibbonWidthPx, ribbonH = cfg.RibbonHeightPx;
-            float xCenter = w * 0.5f, yTop = h * cfg.RibbonTopPct;
+            float xCenter = w * 0.5f;
+
+            // slide up when appearing (from -12px)
+            float slideOffset = (1f - idleAnim01) * 12f;
+            float yTop = h * cfg.RibbonTopPct - slideOffset;
+
+            // premultiply alphas by idleAnim01
+            int bg = ColorUtil.ToRgba((int)(cfg.BgAlpha     * idleAnim01), 0, 0, 0);
+            int border = ColorUtil.ToRgba((int)(cfg.BorderAlpha * idleAnim01), 255, 255, 255);
+            int colMinor = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 230, 230, 230);
+            int colMed   = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 250, 250, 250);
+            int colMajor = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 255, 255, 255);
+            int colCenter= ColorUtil.ToRgba((int)(cfg.CenterAlpha* idleAnim01), 220, 240, 255);
+            int colOutline=ColorUtil.ToRgba((int)(255 * idleAnim01), 0, 0, 0);
 
             // Bg + borders
-            int bg = ColorUtil.ToRgba(cfg.BgAlpha, 0, 0, 0);
-            int border = ColorUtil.ToRgba(cfg.BorderAlpha, 255, 255, 255);
             capi.Render.RenderRectangle(xCenter - ribbonW / 2f, yTop, 0f, ribbonW, ribbonH, bg);
             capi.Render.RenderRectangle(xCenter - ribbonW / 2f, yTop, 0f, ribbonW, 1f, border);
             capi.Render.RenderRectangle(xCenter - ribbonW / 2f, yTop + ribbonH - 1f, 0f, ribbonW, 1f, border);
@@ -229,11 +259,6 @@ namespace NavMod
 
             const float visibleDeg = 120f; float pxPerDeg = ribbonW / visibleDeg;
             const int majorStep = 90, medStep = 45, minorStep = 15;
-            int colMinor = ColorUtil.ToRgba(cfg.TickAlpha, 230, 230, 230);
-            int colMed   = ColorUtil.ToRgba(cfg.TickAlpha, 250, 250, 250);
-            int colMajor = ColorUtil.ToRgba(cfg.TickAlpha, 255, 255, 255);
-            int colCenter= ColorUtil.ToRgba(cfg.CenterAlpha, 220, 240, 255);
-            int colOutline=ColorUtil.ToRgba(255, 0, 0, 0);
 
             int firstTick = (int)Math.Floor((headingDisp - visibleDeg / 2f) / minorStep) * minorStep;
             int ticksCount = (int)(visibleDeg / minorStep) + 4;
@@ -258,8 +283,8 @@ namespace NavMod
 
             DrawRectWithOutline(xCenter - 2.5f, yTop + 2f, 5f, ribbonH - 4f, colCenter, colOutline, 1.5f);
 
-            // Target marker (solid red fill)
-            if (TargetX.HasValue && TargetZ.HasValue)
+            // Target marker (only when route active)
+            if (hasRoute && TargetX.HasValue && TargetZ.HasValue)
             {
                 double vx = TargetX.Value - pl.Entity.Pos.X;
                 double vz = TargetZ.Value - pl.Entity.Pos.Z;
@@ -268,13 +293,13 @@ namespace NavMod
                 if (Math.Abs(rel) <= visibleDeg / 2f)
                 {
                     float tx = xCenter + (float)(rel * pxPerDeg);
-                    int colRed = ColorUtil.ToRgba(255, 220, 40, 40);
+                    int colRed = ColorUtil.ToRgba((int)(255 * idleAnim01), 220, 40, 40);
                     capi.Render.RenderRectangle(tx - 2f, yTop + 4f, 0f, 4f, ribbonH - 8f, colRed);
                 }
             }
 
-            // HUD overlay with outline
-            if (hasHudTarget && routePos < routeHud.Count)
+            // HUD overlay (only when route active)
+            if (hasRoute && routePos < routeHud.Count)
             {
                 var plHud = AbsToHud3(pl.Entity.Pos.X, pl.Entity.Pos.Y, pl.Entity.Pos.Z);
                 var tgtHud = routeHud[routePos];
@@ -322,7 +347,7 @@ namespace NavMod
         }
         static double Hud2Dist(in Vec3d a, in Vec3d b)
         {
-            double dx = a.X - b.X, dz = a.Z - b.Z; return Math.Sqrt(dx * dx + dz * dz);
+            double dx = a.X - b.X, dz = a.Z; dz -= b.Z; return Math.Sqrt(dx * dx + dz * dz);
         }
         static double Hud3Dist(in Vec3d a, in Vec3d b)
         {
@@ -349,10 +374,10 @@ namespace NavMod
             if (blackTex != null && blackTex.TextureId != 0)
             {
                 float o = 1.5f;
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f - o, ty, tw, th, 10f);
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f + o, ty, tw, th, 10f);
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty - o, tw, th, 10f);
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty + o, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f - o, ty, tw, th, (10f));
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f + o, ty, tw, th, (10f));
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty - o, tw, th, (10f));
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty + o, tw, th, (10f));
             }
 
             capi.Render.Render2DTexturePremultipliedAlpha(mainTex.TextureId, x - tw / 2f, ty, tw, th, 11f);

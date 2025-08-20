@@ -10,6 +10,9 @@ namespace NavMod
         CompassRibbonRenderer compass;
         TlPathService svc;
 
+        // локальное состояние idle-компаса
+        bool idleVisible = false;
+
         public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Client;
 
         public override void StartClientSide(ICoreClientAPI api)
@@ -22,6 +25,9 @@ namespace NavMod
             var datadir = System.IO.Path.Combine(capi.GetOrCreateDataPath("tlpath"), "client");
             svc = new TlPathService(capi, datadir, compass);
 
+            // начальное состояние idle-показа
+            compass.SetIdleVisible(idleVisible);
+
             capi.RegisterCommand("tlpath", "Navigate via TL", "",
                 (int groupId, CmdArgs args) =>
                 {
@@ -32,13 +38,13 @@ namespace NavMod
                     {
                         case "find":
                         {
-                            // .tlpath find [x z] — HUD-координаты. Без аргументов — к 0 0.
+                            // .tlpath find [x z] — HUD coords; default 0 0
                             int x = 0, z = 0;
                             if (args.Length >= 2 &&
                                 int.TryParse(args.PopWord(), out x) &&
                                 int.TryParse(args.PopWord(), out z))
                             {
-                                // ok
+                                // parsed
                             }
                             svc.FindRouteTo(x, z);
                             return;
@@ -46,7 +52,7 @@ namespace NavMod
 
                         case "walk":
                         {
-                            // .tlpath walk <радиусHUD>
+                            // .tlpath walk <radiusHUD>
                             if (args.Length == 0 || !int.TryParse(args.PopWord(), out int r))
                             {
                                 capi.ShowChatMessage($"[tl] walk={svc.WalkRadius:0} (HUD)");
@@ -62,6 +68,28 @@ namespace NavMod
                             capi.ShowChatMessage("[tl] navigation stopped");
                             return;
 
+                        case "link":
+                        {
+                            // .tlpath link [url] — show or set GeoJSON link
+                            if (args.Length == 0)
+                            {
+                                capi.ShowChatMessage("[tl] current GeoJSON: " + svc.GetRemoteUrl());
+                                return;
+                            }
+                            string url = args.PopAll();
+                            svc.SetRemoteUrl(url);
+                            return;
+                        }
+
+                        case "show":
+                        {
+                            // .tlpath show — toggle idle compass visibility
+                            idleVisible = !idleVisible;
+                            compass.SetIdleVisible(idleVisible);
+                            capi.ShowChatMessage($"[tl] idle compass: {(idleVisible ? "on" : "off")}");
+                            return;
+                        }
+
                         default:
                             Help();
                             return;
@@ -76,7 +104,8 @@ namespace NavMod
             capi.ShowChatMessage("  .tlpath find [x z]   — plot a route to the specified coordinates");
             capi.ShowChatMessage("  .tlpath walk <r>     — set the radius for walking connections between TLs");
             capi.ShowChatMessage("  .tlpath stop         — stop and clear the current route");
-            capi.ShowChatMessage("  .tlpath link <url>         — set a GeoJSON link to update data");
+            capi.ShowChatMessage("  .tlpath link [url]   — show or set the GeoJSON source URL");
+            capi.ShowChatMessage("  .tlpath show         — toggle idle compass on/off");
         }
 
         public override void Dispose()
