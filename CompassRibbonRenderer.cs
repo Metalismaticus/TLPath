@@ -1,4 +1,4 @@
-﻿﻿using System;
+﻿using System;
 using System.Collections.Generic;
 using Vintagestory.API.Client;
 using Vintagestory.API.MathTools;
@@ -33,9 +33,9 @@ namespace NavMod
         public double? TargetZ = null;
 
         // Route: ABS and HUD (XZ in HUD, Y absolute)
-        readonly List<Vec3d> routeAbs = new List<Vec3d>();
-        readonly List<Vec3d> routeHud = new List<Vec3d>();
-        readonly List<bool>  isTeleportEdge = new List<bool>(); // edge i->i+1: true = TL
+        readonly List<Vec3d> routeAbs = new();
+        readonly List<Vec3d> routeHud = new();
+        readonly List<bool>  isTeleportEdge = new(); // edge i->i+1: true = TL
         int routePos = 0;
 
         // Thresholds
@@ -119,6 +119,31 @@ namespace NavMod
             hudBotBlack = new LoadedTexture(capi);
         }
 
+        // === Access for service: planned TL entry/exit in HUD and skipping ===
+        public bool TryGetPlannedTeleportPair(out Vec3d entryHud, out Vec3d exitHud)
+        {
+            entryHud = null; exitHud = null;
+            if (routePos >= 0 && routePos < routeHud.Count &&
+                routePos < isTeleportEdge.Count && isTeleportEdge[routePos] &&
+                routePos + 1 < routeHud.Count)
+            {
+                entryHud = routeHud[routePos];
+                exitHud  = routeHud[routePos + 1];
+                return true;
+            }
+            return false;
+        }
+
+        public bool AdvancePastTeleportPair()
+        {
+            if (routePos < isTeleportEdge.Count && isTeleportEdge[routePos] && routePos + 1 < routeAbs.Count)
+            {
+                AdvanceBy(2);
+                return true;
+            }
+            return false;
+        }
+
         // New entry: points + TL-edge flags (ABS3)
         public void SetRoute3(List<Vec3d> absPoints, List<bool> tlEdgeFlags)
         {
@@ -195,7 +220,6 @@ namespace NavMod
             double threshold = isLast ? FinalReachHud : ReachDistBlocks;
             if (d > threshold) return;
 
-            // If current target is the entry of a TL edge, skip exit node too
             if (routePos < isTeleportEdge.Count && isTeleportEdge[routePos] == true)
             {
                 AdvanceBy(2);
@@ -218,7 +242,6 @@ namespace NavMod
 
             // animate visibility (route OR idle)
             float target = (hasRoute || showCompassIdle) ? 1f : 0f;
-            // smoothdamp-like exponential lerp
             float k = 1f - (float)Math.Exp(-IdleAnimSpeed * Math.Clamp(dt, 0f, 0.1f));
             idleAnim01 = GameMath.Lerp(idleAnim01, target, k);
 
@@ -230,11 +253,9 @@ namespace NavMod
             float ribbonW = cfg.RibbonWidthPx, ribbonH = cfg.RibbonHeightPx;
             float xCenter = w * 0.5f;
 
-            // slide up when appearing (from -12px)
             float slideOffset = (1f - idleAnim01) * 12f;
             float yTop = h * cfg.RibbonTopPct - slideOffset;
 
-            // premultiply alphas by idleAnim01
             int bg = ColorUtil.ToRgba((int)(cfg.BgAlpha     * idleAnim01), 0, 0, 0);
             int border = ColorUtil.ToRgba((int)(cfg.BorderAlpha * idleAnim01), 255, 255, 255);
             int colMinor = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 230, 230, 230);
@@ -347,7 +368,7 @@ namespace NavMod
         }
         static double Hud2Dist(in Vec3d a, in Vec3d b)
         {
-            double dx = a.X - b.X, dz = a.Z; dz -= b.Z; return Math.Sqrt(dx * dx + dz * dz);
+            double dx = a.X - b.X, dz = a.Z - b.Z; return Math.Sqrt(dx * dx + dz * dz);
         }
         static double Hud3Dist(in Vec3d a, in Vec3d b)
         {
@@ -374,10 +395,10 @@ namespace NavMod
             if (blackTex != null && blackTex.TextureId != 0)
             {
                 float o = 1.5f;
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f - o, ty, tw, th, (10f));
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f + o, ty, tw, th, (10f));
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty - o, tw, th, (10f));
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty + o, tw, th, (10f));
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f - o, ty, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f + o, ty, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty - o, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty + o, tw, th, 10f);
             }
 
             capi.Render.Render2DTexturePremultipliedAlpha(mainTex.TextureId, x - tw / 2f, ty, tw, th, 11f);
