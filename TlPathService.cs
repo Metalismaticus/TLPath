@@ -1,4 +1,4 @@
-﻿﻿using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -28,6 +28,26 @@ namespace NavMod
         readonly HttpClient http = new HttpClient();
         readonly CompassRibbonRenderer compass;
 
+        // ===== Автопересчёт ТОЛЬКО при сходе / неплановом телепорте =====
+        Vec3d currentGoalHud = null;               // конечная цель (HUD)
+        Vec3d prevPosHud = null;                   // позиция в предыдущем тике (HUD)
+        DateTime lastRecalcAt = DateTime.MinValue; // антиспам-кулдаун глобально
+        DateTime lastLegitTlAt = DateTime.MinValue;// «плановый» TL для грейс-периода
+        DateTime? pendingRecalcAt = null;          // отложенный пересчёт после НЕпланового TL
+
+        // Активный маршрут (HUD) и прогресс по нему
+        List<Vec3d> activeRouteHud = null;
+        List<bool>  activeTlFlags  = null; // edge i->i+1: true = TL
+        int activeRoutePos = 0;            // индекс текущей точки (ожидаемой)
+
+        // Порог/радиусы/времена
+        const double TLJumpThreshHUD    = 200.0;  // скачок между тиками => телепорт
+        const double TLNearRadiusHUD    = 150.0;  // «рядом с TL-входом/выходом»
+        const double CorridorRadiusHUD  = 250.0;  // ширина «коридора» разрешённого отклонения от сегмента
+        static readonly TimeSpan RecalcCooldown   = TimeSpan.FromSeconds(3); // антиспам пересчётов
+        static readonly TimeSpan TlGrace          = TimeSpan.FromSeconds(6); // после планового TL
+        const double PendingRecalcDelaySec        = 2.0;                      // задержка после НЕпланового TL
+
         public TlPathService(ICoreClientAPI capi, string dataDir, CompassRibbonRenderer compass)
         {
             this.capi = capi;
@@ -39,8 +59,10 @@ namespace NavMod
             geoPath = Path.Combine(dataDir, "translocators.geojson");
             LoadCfg();
 
-            // применяем сохранённый флаг "показывать пустой компас"
             ApplyIdleFlagToCompass();
+
+            // отслеживаем движение игрока
+            capi.Event.RegisterGameTickListener(OnClientTick, 50);
         }
 
         // ===== config =====
@@ -102,7 +124,6 @@ namespace NavMod
                 : "[tl] Compass: idle display OFF");
         }
 
-        // helper: "on/off/true/false/1/0" → bool? ; null if unknown/empty
         bool? ParseBoolLoose(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return null;
@@ -212,10 +233,9 @@ namespace NavMod
 
         class Graph
         {
-            public readonly List<Vec3d> Nodes = new List<Vec3d>();
-            public readonly List<List<(int to, double w)>> Adj = new List<List<(int, double)>>();
-            // explicit TL-edge registry to avoid “weight≈3” heuristics
-            public readonly HashSet<(int a, int b)> Tele = new HashSet<(int, int)>();
+            public readonly List<Vec3d> Nodes = new();
+            public readonly List<List<(int to, double w)>> Adj = new();
+            public readonly HashSet<(int a, int b)> Tele = new();
 
             public int AddNode(Vec3d p)
             {
@@ -450,6 +470,129 @@ namespace NavMod
             onReady();
         }
 
+        // ===== Вспомогательные для «коридора» и TL-пары =====
+        int FindNearestRouteIndex(Vec3d p, double radiusHud)
+        {
+            if (activeRouteHud == null || activeRouteHud.Count == 0) return -1;
+            double r2 = radiusHud * radiusHud;
+            int best = -1; double bestD2 = double.MaxValue;
+            for (int i = 0; i < activeRouteHud.Count; i++)
+            {
+                double d2 = Dist2_HUD(p, activeRouteHud[i]);
+                if (d2 <= r2 && d2 < bestD2) { bestD2 = d2; best = i; }
+            }
+            return best;
+        }
+
+        static double DistPointToSegment2D(Vec3d p, Vec3d a, Vec3d b)
+        {
+            double vx = b.X - a.X, vz = b.Z - a.Z;
+            double wx = p.X - a.X, wz = p.Z - a.Z;
+            double vv = vx * vx + vz * vz;
+            if (vv <= 1e-9) return Math.Sqrt(Dist2_HUD(p, a));
+            double t = (vx * wx + vz * wz) / vv;
+            t = Math.Min(1.0, Math.Max(0.0, t));
+            double projx = a.X + t * vx, projz = a.Z + t * vz;
+            double dx = p.X - projx, dz = p.Z - projz;
+            return Math.Sqrt(dx * dx + dz * dz);
+        }
+
+        // ===== Тик: проверяем НЕплановый TL (отложенный пересчёт) и «сход» из коридора =====
+        void OnClientTick(float dt)
+        {
+            var ent = capi.World?.Player?.Entity;
+            if (ent == null) return;
+            if (activeRouteHud == null || activeRouteHud.Count < 2 || currentGoalHud == null) { prevPosHud = null; pendingRecalcAt = null; return; }
+
+            var meHud = AbsToHud3(ent.Pos.X, ent.Pos.Y, ent.Pos.Z);
+
+            // --- Обработка отложенного пересчёта после НЕпланового телепорта (чисто по времени)
+            if (pendingRecalcAt.HasValue)
+            {
+                if (DateTime.UtcNow >= pendingRecalcAt.Value && DateTime.UtcNow - lastRecalcAt > RecalcCooldown)
+                {
+                    FindRouteTo((int)currentGoalHud.X, (int)currentGoalHud.Z);
+                    lastRecalcAt = DateTime.UtcNow;
+                    pendingRecalcAt = null;
+                    prevPosHud = meHud;
+                    return;
+                }
+            }
+
+            // 1) Детект телепорта
+            if (prevPosHud != null)
+            {
+                double step = Math.Sqrt(Dist2_HUD(meHud, prevPosHud));
+                if (step >= TLJumpThreshHUD)
+                {
+                    // Попробуем сопоставить с плановой TL-парой маршрута
+                    int idxPrev = FindNearestRouteIndex(prevPosHud, TLNearRadiusHUD);
+                    int idxCur  = FindNearestRouteIndex(meHud,     TLNearRadiusHUD);
+
+                    bool looksLikePlannedPair = false;
+                    if (idxPrev >= 0 && idxCur >= 0 && Math.Abs(idxCur - idxPrev) == 1)
+                    {
+                        int a = Math.Min(idxPrev, idxCur);
+                        if (a < activeTlFlags.Count && activeTlFlags[a])
+                        {
+                            looksLikePlannedPair = true;
+                            // продвинем позицию до выхода
+                            activeRoutePos = Math.Max(activeRoutePos, Math.Max(idxPrev, idxCur));
+                        }
+                    }
+
+                    if (looksLikePlannedPair)
+                    {
+                        lastLegitTlAt = DateTime.UtcNow;
+                        lastRecalcAt  = DateTime.UtcNow; // антидребезг
+                        pendingRecalcAt = null;          // отменяем отложенный, если был
+                        prevPosHud = meHud;
+                        return;
+                    }
+                    else
+                    {
+                        // НЕплановый телепорт → ставим отложенный пересчёт на фикс. время (5с)
+                        pendingRecalcAt = DateTime.UtcNow.AddSeconds(PendingRecalcDelaySec);
+                        prevPosHud = meHud;
+                        return;
+                    }
+                }
+            }
+
+            // 2) Проверка «схода» из коридора вокруг текущего сегмента (без телепортов)
+            if (activeRoutePos < activeRouteHud.Count - 1)
+            {
+                // если только что был законный TL — даём «поблажку»
+                if (DateTime.UtcNow - lastLegitTlAt > TlGrace)
+                {
+                    var a = activeRouteHud[activeRoutePos];
+                    var b = activeRouteHud[activeRoutePos + 1];
+                    double distToSeg = DistPointToSegment2D(meHud, a, b);
+
+                    if (distToSeg > CorridorRadiusHUD && DateTime.UtcNow - lastRecalcAt > RecalcCooldown)
+                    {
+                        FindRouteTo((int)currentGoalHud.X, (int)currentGoalHud.Z);
+                        lastRecalcAt = DateTime.UtcNow;
+                        pendingRecalcAt = null; // явный сход отменяет возможный отложенный
+                        prevPosHud = meHud;
+                        return;
+                    }
+                }
+            }
+
+            // 3) Обновим «ожидаемую» текущую точку по близости к маршруту (мягкое продвижение)
+            {
+                int nearIdx = FindNearestRouteIndex(meHud, TLNearRadiusHUD);
+                if (nearIdx >= 0)
+                {
+                    if (nearIdx >= activeRoutePos - 1)
+                        activeRoutePos = Math.Max(activeRoutePos, nearIdx);
+                }
+            }
+
+            prevPosHud = meHud;
+        }
+
         // ===== API =====
 
         public void FindRouteTo(int destX, int destYhud)
@@ -463,6 +606,13 @@ namespace NavMod
                 var pos = capi.World.Player.Entity.Pos;
                 Vec3d meHud = AbsToHud3(pos.X, pos.Y, pos.Z);
                 Vec3d goalHud = new Vec3d(destX, meHud.Y, destYhud);
+
+                // обновим цель и сбросим прогресс маршрута
+                currentGoalHud = goalHud;
+                activeRouteHud = null;
+                activeTlFlags  = null;
+                activeRoutePos = 0;
+                pendingRecalcAt = null; // новый маршрут — очистка отложенного состояния
 
                 if (Math.Sqrt(Dist2_HUD(meHud, goalHud)) <= cfg.FinishDirectHud)
                 {
@@ -549,12 +699,12 @@ namespace NavMod
                     tlFlags.Add(isTL);
                     if (isTL) tp++;
 
-                    // безопасно берём вес: без Exception при расхождении
+                    // безопасно берём вес
                     var edge = g.Adj[a].FirstOrDefault(e => e.to == b);
                     if (!isTL)
                     {
                         if (edge.to == b) walkSec += edge.w;
-                        else walkSec += WalkTime(g.Nodes[a], g.Nodes[b]); // редкая защита
+                        else walkSec += WalkTime(g.Nodes[a], g.Nodes[b]);
                     }
                 }
 
@@ -571,6 +721,11 @@ namespace NavMod
                 double walkMin  = walkSec  / 60.0;
                 capi.ShowChatMessage($"[tl] ETA ≈ {totalMin:0.#} min ({tp} TL, {walkMin:0.#} min walking)");
 
+                // Сохраняем активный маршрут для «коридора»/TL-пар
+                activeRouteHud = hudPoints;
+                activeTlFlags  = tlFlags;
+                activeRoutePos = 0;
+
                 compass?.SetRoute3(absPoints, tlFlags);
             });
         }
@@ -581,6 +736,12 @@ namespace NavMod
         {
             compass?.ClearTargetsQueue();
             compass?.SetTarget(null, null);
+            currentGoalHud = null;
+            prevPosHud = null;
+            activeRouteHud = null;
+            activeTlFlags  = null;
+            activeRoutePos = 0;
+            pendingRecalcAt = null;
         }
     }
 }
