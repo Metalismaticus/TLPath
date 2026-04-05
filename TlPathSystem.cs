@@ -1,4 +1,5 @@
-﻿﻿﻿using System;
+#nullable disable
+using System;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 
@@ -9,6 +10,7 @@ namespace NavMod
         ICoreClientAPI capi;
         CompassRibbonRenderer compass;
         TlPathService svc;
+        TlPathGui     gui;
 
         public override bool ShouldLoad(EnumAppSide side) => side == EnumAppSide.Client;
 
@@ -21,7 +23,18 @@ namespace NavMod
 
             var datadir = System.IO.Path.Combine(capi.GetOrCreateDataPath("tlpath"), "client");
             svc = new TlPathService(capi, datadir, compass);
+            gui = new TlPathGui(capi, svc);
 
+            // ── Hotkey ───────────────────────────────────────────────────────
+            capi.Input.RegisterHotKey(
+                "tlpathgui",
+                "TLPath: Open navigation window",
+                GlKeys.N,
+                HotkeyType.GUIOrOtherControls);
+
+            capi.Input.SetHotKeyHandler("tlpathgui", _ => { gui.Open(); return true; });
+
+            // ── Commands ─────────────────────────────────────────────────────
             capi.RegisterCommand("tlpath", "Navigate via TL", "",
                 (int groupId, CmdArgs args) =>
                 {
@@ -32,76 +45,86 @@ namespace NavMod
                     {
                         case "find":
                         {
-                            // .tlpath find [x z] — HUD coords; default 0 0
-                            int x = 0, z = 0;
+                            // FIX #9: parse as double
+                            double x = 0, z = 0;
                             if (args.Length >= 2 &&
-                                int.TryParse(args.PopWord(), out x) &&
-                                int.TryParse(args.PopWord(), out z))
-                            {
-                                // parsed
-                            }
+                                double.TryParse(args.PopWord(), System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out x) &&
+                                double.TryParse(args.PopWord(), System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out z))
+                            { /* parsed */ }
                             svc.FindRouteTo(x, z);
+                            svc.AddToHistory((int)Math.Round(x), (int)Math.Round(z));
                             return;
                         }
 
                         case "walk":
                         {
-                            // .tlpath walk <radiusHUD>
-                            if (args.Length == 0 || !int.TryParse(args.PopWord(), out int r))
+                            if (args.Length == 0 || !double.TryParse(args.PopWord(),
+                                System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out double r))
                             {
-                                capi.ShowChatMessage($"[tl] walk={svc.WalkRadius:0} (HUD)");
+                                capi.ShowChatMessage($"[tl] walk radius = {svc.WalkRadius:0} (in-game units)");
                                 return;
                             }
                             svc.SetWalkRadius(r);
-                            capi.ShowChatMessage($"[tl] walk set to {svc.WalkRadius:0} (HUD)");
+                            capi.ShowChatMessage($"[tl] walk radius set to {r:0} (in-game units)");
                             return;
                         }
 
                         case "stop":
                             svc.ClearCompass();
-                            capi.ShowChatMessage("[tl] navigation stopped");
+                            capi.ShowChatMessage("[tl] Navigation stopped.");
                             return;
 
                         case "link":
+                            if (args.Length == 0) { capi.ShowChatMessage("[tl] GeoJSON URL: " + svc.GetRemoteUrl()); return; }
+                            svc.SetRemoteUrl(args.PopAll());
+                            return;
+
+                        case "show":
+                            svc.CmdShow();
+                            return;
+
+                        case "fav":
+                        case "save":
                         {
-                            // .tlpath link [url] — show or set GeoJSON link
-                            if (args.Length == 0)
-                            {
-                                capi.ShowChatMessage("[tl] current GeoJSON: " + svc.GetRemoteUrl());
-                                return;
-                            }
-                            string url = args.PopAll();
-                            svc.SetRemoteUrl(url);
+                            string name = args.Length > 0 ? args.PopAll().Trim() : "";
+                            if (string.IsNullOrEmpty(name)) { capi.ShowChatMessage("[tl] Usage: .tlpath fav <name>"); return; }
+                            svc.SaveFavourite(name);
                             return;
                         }
 
-                        case "show":
-                        {
-                            // .tlpath show — toggle idle compass visibility (delegated to service)
-                            svc.CmdShow();
+                        case "reverse":
+                            capi.ShowChatMessage("[tl] 'reverse' command removed. Use .tlpath find <x z> instead.");
                             return;
-                        }
+
+                        case "gui":
+                            gui.Open();
+                            return;
 
                         default:
                             Help();
                             return;
                     }
-                }
-            );
+                });
         }
 
         void Help()
         {
             capi.ShowChatMessage("[tl] commands:");
-            capi.ShowChatMessage("  .tlpath find [x z]   — plot a route to the specified coordinates");
-            capi.ShowChatMessage("  .tlpath walk <r>     — set the radius for walking connections between TLs");
-            capi.ShowChatMessage("  .tlpath stop         — stop and clear the current route");
-            capi.ShowChatMessage("  .tlpath link [url]   — show or set the GeoJSON source URL");
-            capi.ShowChatMessage("  .tlpath show         — toggle idle compass on/off");
+            capi.ShowChatMessage("  .tlpath find <x z>    — plot route to coordinates");
+            capi.ShowChatMessage("  .tlpath walk <r>      — set walk radius (in-game units)");
+            capi.ShowChatMessage("  .tlpath stop          — stop and clear current route");
+            capi.ShowChatMessage("  .tlpath link [url]    — show or set GeoJSON source URL");
+            capi.ShowChatMessage("  .tlpath show          — toggle idle compass on/off");
+            capi.ShowChatMessage("  .tlpath fav <name>    — save current route as favourite");
+            capi.ShowChatMessage("  .tlpath gui           — open navigation window  [hotkey: N]");
         }
 
         public override void Dispose()
         {
+            gui?.TryClose();
             compass?.Dispose();
         }
     }

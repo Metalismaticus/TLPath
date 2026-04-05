@@ -1,4 +1,5 @@
-﻿using System;
+#nullable disable
+using System;
 using System.Collections.Generic;
 using Vintagestory.API.Client;
 using Vintagestory.API.MathTools;
@@ -7,111 +8,125 @@ namespace NavMod
 {
     /// <summary>
     /// Ribbon-compass + target marker + 3D waypoint queue.
-    /// TL progress on top, current HUD target below.
-    /// Switch:
-    ///  - intermediate points: 3D threshold (ReachDistBlocks)
-    ///  - final point: 2D HUD threshold (FinalReachHud)
-    ///  - TL pair: skip exit node after hitting entry
-    ///  Additionally:
-    ///  - Idle compass: when no route but showCompassIdle=true, draw compass without targets.
-    ///  - Smooth fade/slide animation in/out for idle visibility.
+    ///
+    /// Fixes applied:
+    ///  #3  RoutePos is now a public property so TlPathService can read/sync it.
+    ///      A RouteCompleted event lets the service know when the renderer auto-advances to the end.
+    ///  #6  AbsToHud3 removed; NavUtils.AbsToHud3 used instead.
+    ///  #7  fontRed built via a fresh CairoFont instance so .Color assignment sticks.
+    ///  #11 RenderTextCenteredWithOutline caches last rendered string; GenOrUpdateTextTexture
+    ///      is only called when the text actually changes.
     /// </summary>
     public class CompassRibbonRenderer : IRenderer
     {
         readonly ICoreClientAPI capi;
         public bool Enabled = true;
 
-        // Idle compass
-        bool showCompassIdle = false;
-        float idleAnim01 = 0f; // 0..1
-        const float IdleAnimSpeed = 10f; // higher = faster
+        // ── Idle compass ────────────────────────────────────────────────────
+        bool showCompassIdle;
+        float idleAnim01;
+        const float IdleAnimSpeed = 10f;
 
         public void SetIdleVisible(bool on) => showCompassIdle = on;
 
-        // Current target (ABS) for compass marker
-        public double? TargetX = null;
-        public double? TargetZ = null;
+        // ── Route state ─────────────────────────────────────────────────────
+        readonly List<Vec3d> routeAbs         = new();
+        readonly List<Vec3d> routeHud         = new();
+        readonly List<bool>  isTeleportEdge   = new();
 
-        // Route: ABS and HUD (XZ in HUD, Y absolute)
-        readonly List<Vec3d> routeAbs = new();
-        readonly List<Vec3d> routeHud = new();
-        readonly List<bool>  isTeleportEdge = new(); // edge i->i+1: true = TL
-        int routePos = 0;
+        // FIX #3: public read-only property so TlPathService can sync
+        public int RoutePos { get; private set; }
+        public int RouteCount => routeHud.Count;
 
-        // Thresholds
-        public double ReachDistBlocks = 1;   // 3D for intermediate points
-        public double FinalReachHud   = 10;  // 2D HUD for the final point
-
-        // TL progress
-        int TotalTeleports  => isTeleportEdge.Count > 0 ? CountTrue(isTeleportEdge) : 0;
-        int PassedTeleports => CountTrue(isTeleportEdge, 0, Math.Min(routePos, isTeleportEdge.Count));
-
-        // HUD target for bottom line
-        bool hasHudTarget = false;
+        public double? TargetX;
+        public double? TargetZ;
+        bool hasHudTarget;
         Vec3d currentHudTarget;
 
-        // Text / fonts
+        // FIX #3: event fired when renderer auto-advances past the last point
+        public event Action RouteCompleted;
+        // FIX #3: event fired on each auto-advance (step index = new RoutePos)
+        public event Action<int> RouteAdvanced;
+
+        // ── Thresholds ──────────────────────────────────────────────────────
+        public double ReachDistBlocks = 1;
+        public double FinalReachHud   = 10;
+
+        // ── TL progress (read from RoutePos, not a separate counter) ────────
+        int TotalTeleports  => CountTrue(isTeleportEdge);
+        int PassedTeleports => CountTrue(isTeleportEdge, 0, Math.Min(RoutePos, isTeleportEdge.Count));
+
+        // ── Fonts ───────────────────────────────────────────────────────────
         readonly TextTextureUtil ttu;
+
+        // FIX #7: build fontRed as a completely separate instance so .Color sticks
         readonly CairoFont fontWhite;
         readonly CairoFont fontRed;
         readonly CairoFont fontHud;
         readonly CairoFont fontHudBlack;
 
+        // ── Cardinal textures (created once in ctor) ────────────────────────
         LoadedTexture nTex, eTex, sTex, wTex;
         LoadedTexture nTexBlack, eTexBlack, sTexBlack, wTexBlack;
 
+        // ── HUD overlay textures ────────────────────────────────────────────
         LoadedTexture hudTopWhite, hudTopBlack;
         LoadedTexture hudBotWhite, hudBotBlack;
 
-        // Heading smoothing
-        double headingAcc;
-        bool accInit;
+        // FIX #11: cache last rendered strings to avoid regenerating every frame
+        string lastTopLine = null;
+        string lastBotLine = null;
 
+        // ── Heading smoothing ───────────────────────────────────────────────
+        double headingAcc;
+        bool   accInit;
+
+        // ── Layout constants ────────────────────────────────────────────────
         struct HudCfg
         {
-            public float RibbonWidthPx;
-            public float RibbonHeightPx;
-            public float RibbonTopPct;
-            public int BgAlpha;
-            public int BorderAlpha;
-            public int TickAlpha;
-            public int CenterAlpha;
+            public float RibbonWidthPx, RibbonHeightPx, RibbonTopPct;
+            public int   BgAlpha, BorderAlpha, TickAlpha, CenterAlpha;
         }
         static readonly HudCfg cfg = new HudCfg
         {
-            RibbonWidthPx = 400f,
+            RibbonWidthPx  = 400f,
             RibbonHeightPx = 40f,
-            RibbonTopPct = 0.10f,
-            BgAlpha = 90,
-            BorderAlpha = 140,
-            TickAlpha = 210,
-            CenterAlpha = 200
+            RibbonTopPct   = 0.10f,
+            BgAlpha        = 90,
+            BorderAlpha    = 140,
+            TickAlpha      = 210,
+            CenterAlpha    = 200
         };
 
+        // ────────────────────────────────────────────────────────────────────
         public CompassRibbonRenderer(ICoreClientAPI capi)
         {
             this.capi = capi;
             ttu = new TextTextureUtil(capi);
 
-            fontWhite = CairoFont.WhiteSmallText().WithFontSize(20);
-            fontRed   = CairoFont.WhiteSmallText().WithFontSize(20);
-            fontRed.Color = new double[] { 1, 0.2, 0.2, 1 };
+            // FIX #7: create each font as an independent object
+            fontWhite    = CairoFont.WhiteSmallText().WithFontSize(20);
 
-            fontHud = CairoFont.WhiteSmallText().WithFontSize(18);
+            fontRed      = CairoFont.WhiteSmallText().WithFontSize(20);
+            fontRed.Color = new double[] { 1.0, 0.2, 0.2, 1.0 };   // red N
+
+            fontHud      = CairoFont.WhiteSmallText().WithFontSize(18);
+
             fontHudBlack = CairoFont.WhiteSmallText().WithFontSize(18);
-            fontHudBlack.Color = new double[] { 0, 0, 0, 1 };
+            fontHudBlack.Color = new double[] { 0.0, 0.0, 0.0, 1.0 };
 
-            nTex = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("N", fontRed,   ref nTex);
-            eTex = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("E", fontWhite, ref eTex);
-            sTex = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("S", fontWhite, ref sTex);
-            wTex = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("W", fontWhite, ref wTex);
+            var fontBlack20      = CairoFont.WhiteSmallText().WithFontSize(20);
+            fontBlack20.Color    = new double[] { 0.0, 0.0, 0.0, 1.0 };
 
-            var black = CairoFont.WhiteSmallText().WithFontSize(20);
-            black.Color = new double[] { 0, 0, 0, 1 };
-            nTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("N", black, ref nTexBlack);
-            eTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("E", black, ref eTexBlack);
-            sTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("S", black, ref sTexBlack);
-            wTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("W", black, ref wTexBlack);
+            nTex      = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("N", fontRed,      ref nTex);
+            eTex      = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("E", fontWhite,    ref eTex);
+            sTex      = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("S", fontWhite,    ref sTex);
+            wTex      = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("W", fontWhite,    ref wTex);
+
+            nTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("N", fontBlack20,  ref nTexBlack);
+            eTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("E", fontBlack20,  ref eTexBlack);
+            sTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("S", fontBlack20,  ref sTexBlack);
+            wTexBlack = new LoadedTexture(capi); ttu.GenOrUpdateTextTexture("W", fontBlack20,  ref wTexBlack);
 
             hudTopWhite = new LoadedTexture(capi);
             hudTopBlack = new LoadedTexture(capi);
@@ -119,16 +134,79 @@ namespace NavMod
             hudBotBlack = new LoadedTexture(capi);
         }
 
-        // === Access for service: planned TL entry/exit in HUD and skipping ===
+        // ── Route setup ─────────────────────────────────────────────────────
+
+        public void SetRoute3(List<Vec3d> absPoints, List<bool> tlEdgeFlags)
+        {
+            routeAbs.Clear(); routeHud.Clear(); isTeleportEdge.Clear();
+            RoutePos = 0; hasHudTarget = false; TargetX = TargetZ = null;
+            lastTopLine = null; lastBotLine = null; // FIX #11: invalidate cache
+
+            if (absPoints != null) routeAbs.AddRange(absPoints);
+
+            // FIX #6: use NavUtils
+            foreach (var p in routeAbs)
+                routeHud.Add(NavUtils.AbsToHud3(capi, p.X, p.Y, p.Z));
+
+            if (tlEdgeFlags != null && tlEdgeFlags.Count == Math.Max(0, routeAbs.Count - 1))
+                isTeleportEdge.AddRange(tlEdgeFlags);
+            else
+                for (int i = 0; i + 1 < routeHud.Count; i++)
+                    isTeleportEdge.Add(NavUtils.Hud2Dist(routeHud[i], routeHud[i + 1]) <= 1.5);
+
+            // Skip points we're already standing on
+            if (routeHud.Count > 0)
+            {
+                var epos  = capi.World.Player.Entity.SidedPos;
+                var plHud = NavUtils.AbsToHud3(capi, epos.X, epos.Y, epos.Z);
+                while (RoutePos < routeHud.Count && NavUtils.Hud3Dist(plHud, routeHud[RoutePos]) <= ReachDistBlocks)
+                    RoutePos++;
+            }
+
+            if (RoutePos < routeAbs.Count)
+            {
+                TargetX          = routeAbs[RoutePos].X;
+                TargetZ          = routeAbs[RoutePos].Z;
+                currentHudTarget = routeHud[RoutePos];
+                hasHudTarget     = true;
+            }
+        }
+
+        // FIX #3: allow service to forcibly sync RoutePos (e.g. after TL detection)
+        public void SyncRoutePos(int pos)
+        {
+            if (pos < 0 || pos >= routeAbs.Count) return;
+            RoutePos         = pos;
+            TargetX          = routeAbs[RoutePos].X;
+            TargetZ          = routeAbs[RoutePos].Z;
+            currentHudTarget = routeHud[RoutePos];
+            hasHudTarget     = true;
+            lastTopLine      = null; // FIX #11: force text refresh
+            lastBotLine      = null;
+        }
+
+        public void ClearRoute()
+        {
+            routeAbs.Clear(); routeHud.Clear(); isTeleportEdge.Clear();
+            RoutePos = 0; hasHudTarget = false; TargetX = TargetZ = null;
+            lastTopLine = null; lastBotLine = null;
+        }
+
+        // Keep backward-compat names used in TlPathService
+        public void ClearTargetsQueue() => ClearRoute();
+        public void SetTarget(double? x, double? z) { TargetX = x; TargetZ = z; }
+
+        // ── Planned TL helpers (used by TlPathService tick) ─────────────────
+
         public bool TryGetPlannedTeleportPair(out Vec3d entryHud, out Vec3d exitHud)
         {
             entryHud = null; exitHud = null;
-            if (routePos >= 0 && routePos < routeHud.Count &&
-                routePos < isTeleportEdge.Count && isTeleportEdge[routePos] &&
-                routePos + 1 < routeHud.Count)
+            if (RoutePos < routeHud.Count &&
+                RoutePos < isTeleportEdge.Count && isTeleportEdge[RoutePos] &&
+                RoutePos + 1 < routeHud.Count)
             {
-                entryHud = routeHud[routePos];
-                exitHud  = routeHud[routePos + 1];
+                entryHud = routeHud[RoutePos];
+                exitHud  = routeHud[RoutePos + 1];
                 return true;
             }
             return false;
@@ -136,7 +214,7 @@ namespace NavMod
 
         public bool AdvancePastTeleportPair()
         {
-            if (routePos < isTeleportEdge.Count && isTeleportEdge[routePos] && routePos + 1 < routeAbs.Count)
+            if (RoutePos < isTeleportEdge.Count && isTeleportEdge[RoutePos] && RoutePos + 1 < routeAbs.Count)
             {
                 AdvanceBy(2);
                 return true;
@@ -144,40 +222,7 @@ namespace NavMod
             return false;
         }
 
-        // New entry: points + TL-edge flags (ABS3)
-        public void SetRoute3(List<Vec3d> absPoints, List<bool> tlEdgeFlags)
-        {
-            routeAbs.Clear(); routeHud.Clear(); isTeleportEdge.Clear();
-            routePos = 0; hasHudTarget = false; TargetX = TargetZ = null;
-
-            if (absPoints != null) routeAbs.AddRange(absPoints);
-            foreach (var p in routeAbs) routeHud.Add(AbsToHud3(p.X, p.Y, p.Z));
-
-            if (tlEdgeFlags != null && tlEdgeFlags.Count == Math.Max(0, routeAbs.Count - 1))
-                isTeleportEdge.AddRange(tlEdgeFlags);
-            else
-                for (int i = 0; i + 1 < routeHud.Count; i++)
-                    isTeleportEdge.Add(Hud2Dist(routeHud[i], routeHud[i + 1]) <= 1.5);
-
-            // Skip initial points if we already stand on them (3D)
-            if (routeHud.Count > 0)
-            {
-                var pl = capi.World.Player.Entity.Pos;
-                var plHud = AbsToHud3(pl.X, pl.Y, pl.Z);
-                while (routePos < routeHud.Count && Hud3Dist(plHud, routeHud[routePos]) <= ReachDistBlocks)
-                    routePos++;
-            }
-
-            if (routePos < routeAbs.Count)
-            {
-                TargetX = routeAbs[routePos].X;
-                TargetZ = routeAbs[routePos].Z;
-                currentHudTarget = routeHud[routePos];
-                hasHudTarget = true;
-            }
-        }
-
-        // Backward compat: 2D points (Y = player's current)
+        // Backward compat
         public void SetTargetsQueue(IEnumerable<Vec2d> points)
         {
             var list = new List<Vec3d>();
@@ -186,103 +231,99 @@ namespace NavMod
             SetRoute3(list, null);
         }
 
-        public void ClearTargetsQueue()
-        {
-            routeAbs.Clear(); routeHud.Clear(); isTeleportEdge.Clear();
-            routePos = 0; hasHudTarget = false; TargetX = TargetZ = null;
-        }
+        // ── Internal advance ────────────────────────────────────────────────
 
         void AdvanceBy(int steps)
         {
-            routePos += steps;
-            if (routePos >= routeAbs.Count)
+            RoutePos += steps;
+            lastTopLine = null; lastBotLine = null; // FIX #11
+
+            if (RoutePos >= routeAbs.Count)
             {
-                SetTarget(null, null); hasHudTarget = false;
-                capi.ShowChatMessage("[tl] route completed");
+                TargetX = TargetZ = null;
+                hasHudTarget = false;
+                capi.ShowChatMessage("[tl] Route completed!");
+                RouteCompleted?.Invoke();           // FIX #3: notify service
                 return;
             }
-            TargetX = routeAbs[routePos].X; TargetZ = routeAbs[routePos].Z;
-            currentHudTarget = routeHud[routePos]; hasHudTarget = true;
-            capi.ShowChatMessage("[tl] next waypoint");
+
+            TargetX          = routeAbs[RoutePos].X;
+            TargetZ          = routeAbs[RoutePos].Z;
+            currentHudTarget = routeHud[RoutePos];
+            hasHudTarget     = true;
+            RouteAdvanced?.Invoke(RoutePos);        // FIX #3: notify service
         }
 
         void AutoAdvanceIfReached()
         {
-            if (!(TargetX.HasValue && TargetZ.HasValue) || !hasHudTarget) return;
+            if (!hasHudTarget || !TargetX.HasValue || !TargetZ.HasValue) return;
 
-            var pl = capi.World.Player.Entity.Pos;
-            var plHud = AbsToHud3(pl.X, pl.Y, pl.Z);
+            var epos  = capi.World.Player.Entity.SidedPos;
+            var plHud = NavUtils.AbsToHud3(capi, epos.X, epos.Y, epos.Z);
 
-            bool isLast = routePos >= routeHud.Count - 1;
-            double d = isLast ? Hud2Dist(plHud, currentHudTarget)
-                              : Hud3Dist(plHud, currentHudTarget);
-
+            bool   isLast    = RoutePos >= routeHud.Count - 1;
+            double d         = isLast ? NavUtils.Hud2Dist(plHud, currentHudTarget)
+                                      : NavUtils.Hud3Dist(plHud, currentHudTarget);
             double threshold = isLast ? FinalReachHud : ReachDistBlocks;
             if (d > threshold) return;
 
-            if (routePos < isTeleportEdge.Count && isTeleportEdge[routePos] == true)
-            {
+            // Skip TL exit automatically
+            if (RoutePos < isTeleportEdge.Count && isTeleportEdge[RoutePos])
                 AdvanceBy(2);
-            }
             else
-            {
                 AdvanceBy(1);
-            }
         }
 
-        public void SetTarget(double? x, double? z) { TargetX = x; TargetZ = z; }
+        // ── Render ──────────────────────────────────────────────────────────
 
         public void OnRenderFrame(float dt, EnumRenderStage stage)
         {
             if (!Enabled || stage != EnumRenderStage.Ortho) return;
             if (capi?.Render == null || capi.World?.Player?.Entity == null) return;
 
-            // route active?
-            bool hasRoute = routePos < routeHud.Count && hasHudTarget && TargetX.HasValue && TargetZ.HasValue;
+            bool hasRoute = RoutePos < routeHud.Count && hasHudTarget && TargetX.HasValue && TargetZ.HasValue;
 
-            // animate visibility (route OR idle)
             float target = (hasRoute || showCompassIdle) ? 1f : 0f;
             float k = 1f - (float)Math.Exp(-IdleAnimSpeed * Math.Clamp(dt, 0f, 0.1f));
             idleAnim01 = GameMath.Lerp(idleAnim01, target, k);
+            if (idleAnim01 <= 0.01f) return;
 
-            if (idleAnim01 <= 0.01f) return; // fully hidden
-
-            var pl = capi.World.Player;
-            float w = capi.Render.FrameWidth, h = capi.Render.FrameHeight;
-
-            float ribbonW = cfg.RibbonWidthPx, ribbonH = cfg.RibbonHeightPx;
+            var   pl      = capi.World.Player;
+            float w       = capi.Render.FrameWidth;
+            float h       = capi.Render.FrameHeight;
+            float ribbonW = cfg.RibbonWidthPx;
+            float ribbonH = cfg.RibbonHeightPx;
             float xCenter = w * 0.5f;
 
             float slideOffset = (1f - idleAnim01) * 12f;
-            float yTop = h * cfg.RibbonTopPct - slideOffset;
+            float yTop        = h * cfg.RibbonTopPct - slideOffset;
 
-            int bg = ColorUtil.ToRgba((int)(cfg.BgAlpha     * idleAnim01), 0, 0, 0);
-            int border = ColorUtil.ToRgba((int)(cfg.BorderAlpha * idleAnim01), 255, 255, 255);
-            int colMinor = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 230, 230, 230);
-            int colMed   = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 250, 250, 250);
-            int colMajor = ColorUtil.ToRgba((int)(cfg.TickAlpha  * idleAnim01), 255, 255, 255);
-            int colCenter= ColorUtil.ToRgba((int)(cfg.CenterAlpha* idleAnim01), 220, 240, 255);
-            int colOutline=ColorUtil.ToRgba((int)(255 * idleAnim01), 0, 0, 0);
+            int bg       = ColorUtil.ToRgba((int)(cfg.BgAlpha      * idleAnim01), 0,   0,   0);
+            int border   = ColorUtil.ToRgba((int)(cfg.BorderAlpha  * idleAnim01), 255, 255, 255);
+            int colMinor = ColorUtil.ToRgba((int)(cfg.TickAlpha    * idleAnim01), 230, 230, 230);
+            int colMed   = ColorUtil.ToRgba((int)(cfg.TickAlpha    * idleAnim01), 250, 250, 250);
+            int colMajor = ColorUtil.ToRgba((int)(cfg.TickAlpha    * idleAnim01), 255, 255, 255);
+            int colCenter= ColorUtil.ToRgba((int)(cfg.CenterAlpha  * idleAnim01), 220, 240, 255);
+            int colOutline= ColorUtil.ToRgba((int)(255             * idleAnim01), 0,   0,   0);
 
-            // Bg + borders
             capi.Render.RenderRectangle(xCenter - ribbonW / 2f, yTop, 0f, ribbonW, ribbonH, bg);
             capi.Render.RenderRectangle(xCenter - ribbonW / 2f, yTop, 0f, ribbonW, 1f, border);
             capi.Render.RenderRectangle(xCenter - ribbonW / 2f, yTop + ribbonH - 1f, 0f, ribbonW, 1f, border);
 
-            // Heading
-            double yawRad = pl.Entity.Pos.Yaw;
-            double dirX = Math.Sin(yawRad), dirZ = Math.Cos(yawRad);
-            double headingDeg = Normalize360(Math.Atan2(dirX, -dirZ) * GameMath.RAD2DEG);
+            double yawRad    = pl.Entity.SidedPos.Yaw;
+            double headingDeg = Normalize360(Math.Atan2(Math.Sin(yawRad), -Math.Cos(yawRad)) * GameMath.RAD2DEG);
             if (!accInit) { headingAcc = headingDeg; accInit = true; }
-            double alpha = Math.Clamp(dt * 12.0, 0, 1);
-            double delta = AngleDeltaDeg(headingDeg, Normalize360(headingAcc));
-            headingAcc += delta * alpha; double headingDisp = Normalize360(headingAcc);
+            double alpha_  = Math.Clamp(dt * 12.0, 0, 1);
+            headingAcc    += AngleDeltaDeg(headingDeg, Normalize360(headingAcc)) * alpha_;
+            double headingDisp = Normalize360(headingAcc);
 
-            const float visibleDeg = 120f; float pxPerDeg = ribbonW / visibleDeg;
+            const float visibleDeg = 120f;
+            float pxPerDeg = ribbonW / visibleDeg;
             const int majorStep = 90, medStep = 45, minorStep = 15;
 
-            int firstTick = (int)Math.Floor((headingDisp - visibleDeg / 2f) / minorStep) * minorStep;
+            int firstTick  = (int)Math.Floor((headingDisp - visibleDeg / 2f) / minorStep) * minorStep;
             int ticksCount = (int)(visibleDeg / minorStep) + 4;
+
             for (int i = 0; i <= ticksCount; i++)
             {
                 int a = firstTick + i * minorStep;
@@ -290,11 +331,10 @@ namespace NavMod
                 if (Math.Abs(rel) > visibleDeg / 2f) continue;
                 float xx = xCenter + (float)(rel * pxPerDeg);
                 float tickH; int col;
-                if (Modulo(a, majorStep) == 0) { tickH = ribbonH * 0.40f; col = colMajor; }
-                else if (Modulo(a, medStep) == 0) { tickH = ribbonH * 0.52f; col = colMed; }
-                else { tickH = ribbonH * 0.30f; col = colMinor; }
-                float yTick = yTop + ribbonH - tickH - 3f;
-                DrawRectWithOutline(xx - 1f, yTick, 2f, tickH, col, colOutline, 1.5f);
+                if      (Modulo(a, majorStep) == 0) { tickH = ribbonH * 0.40f; col = colMajor; }
+                else if (Modulo(a, medStep)   == 0) { tickH = ribbonH * 0.52f; col = colMed; }
+                else                                { tickH = ribbonH * 0.30f; col = colMinor; }
+                DrawRectWithOutline(xx - 1f, yTop + ribbonH - tickH - 3f, 2f, tickH, col, colOutline, 1.5f);
             }
 
             DrawCardinal(0,   nTex, nTexBlack, xCenter, yTop, headingDisp, pxPerDeg);
@@ -304,104 +344,97 @@ namespace NavMod
 
             DrawRectWithOutline(xCenter - 2.5f, yTop + 2f, 5f, ribbonH - 4f, colCenter, colOutline, 1.5f);
 
-            // Target marker (only when route active)
+            // Target marker
             if (hasRoute && TargetX.HasValue && TargetZ.HasValue)
             {
-                double vx = TargetX.Value - pl.Entity.Pos.X;
-                double vz = TargetZ.Value - pl.Entity.Pos.Z;
+                double vx = TargetX.Value - pl.Entity.SidedPos.X;
+                double vz = TargetZ.Value - pl.Entity.SidedPos.Z;
                 double tgtDeg = Normalize360(Math.Atan2(vx, -vz) * GameMath.RAD2DEG);
                 double rel = AngleDeltaDeg(tgtDeg, headingDisp);
                 if (Math.Abs(rel) <= visibleDeg / 2f)
                 {
                     float tx = xCenter + (float)(rel * pxPerDeg);
-                    int colRed = ColorUtil.ToRgba((int)(255 * idleAnim01), 220, 40, 40);
-                    capi.Render.RenderRectangle(tx - 2f, yTop + 4f, 0f, 4f, ribbonH - 8f, colRed);
+                    capi.Render.RenderRectangle(tx - 2f, yTop + 4f, 0f, 4f, ribbonH - 8f,
+                        ColorUtil.ToRgba((int)(255 * idleAnim01), 220, 40, 40));
                 }
             }
 
-            // HUD overlay (only when route active)
-            if (hasRoute && routePos < routeHud.Count)
+            // HUD overlay text
+            if (hasRoute && RoutePos < routeHud.Count)
             {
-                var plHud = AbsToHud3(pl.Entity.Pos.X, pl.Entity.Pos.Y, pl.Entity.Pos.Z);
-                var tgtHud = routeHud[routePos];
+                var plHud  = NavUtils.AbsToHud3(capi, pl.Entity.SidedPos.X, pl.Entity.SidedPos.Y, pl.Entity.SidedPos.Z);
+                var tgtHud = routeHud[RoutePos];
+                bool isLast = RoutePos >= routeHud.Count - 1;
+                double dist = isLast ? NavUtils.Hud2Dist(plHud, tgtHud) : NavUtils.Hud3Dist(plHud, tgtHud);
 
-                bool isLast = routePos >= routeHud.Count - 1;
-                double dist = isLast ? Hud2Dist(plHud, tgtHud) : Hud3Dist(plHud, tgtHud);
+                // FIX #11: only regenerate texture when text changes
+                string topLine = $"TL {PassedTeleports}/{TotalTeleports},  dist={dist:0}";
+                if (topLine != lastTopLine)
+                {
+                    lastTopLine = topLine;
+                    ttu.GenOrUpdateTextTexture(topLine, fontHudBlack, ref hudTopBlack);
+                    ttu.GenOrUpdateTextTexture(topLine, fontHud,      ref hudTopWhite);
+                }
 
-                string topLine = $"TL {PassedTeleports}/{TotalTeleports}, dist={dist:0}";
-                RenderTextCenteredWithOutline(topLine, xCenter, yTop - 22, ref hudTopWhite, ref hudTopBlack);
+                string botLine = $"Target: {tgtHud.X:0}  {tgtHud.Y:0}  {tgtHud.Z:0}";
+                if (botLine != lastBotLine)
+                {
+                    lastBotLine = botLine;
+                    ttu.GenOrUpdateTextTexture(botLine, fontHudBlack, ref hudBotBlack);
+                    ttu.GenOrUpdateTextTexture(botLine, fontHud,      ref hudBotWhite);
+                }
 
-                string bottomLine = $"Target: {tgtHud.X:0} {tgtHud.Y:0} {tgtHud.Z:0}";
-                RenderTextCenteredWithOutline(bottomLine, xCenter, yTop + cfg.RibbonHeightPx + 6, ref hudBotWhite, ref hudBotBlack);
+                RenderTextWithOutline(hudTopWhite, hudTopBlack, xCenter, yTop - 22);
+                RenderTextWithOutline(hudBotWhite, hudBotBlack, xCenter, yTop + cfg.RibbonHeightPx + 6);
             }
 
             AutoAdvanceIfReached();
         }
 
-        // text with outline
-        void RenderTextCenteredWithOutline(string text, float xCenter, float y, ref LoadedTexture whiteTex, ref LoadedTexture blackTex)
+        // ── Render helpers ───────────────────────────────────────────────────
+
+        // FIX #11: textures are passed in pre-built; no generation here
+        void RenderTextWithOutline(LoadedTexture white, LoadedTexture black, float xCenter, float y)
         {
-            ttu.GenOrUpdateTextTexture(text, fontHudBlack, ref blackTex);
-            ttu.GenOrUpdateTextTexture(text, fontHud,      ref whiteTex);
+            if (white == null || white.TextureId == 0) return;
+            float tw = white.Width, th = white.Height;
+            float bx = xCenter - tw / 2f;
+            const float o = 1.5f;
 
-            float tw = whiteTex.Width, th = whiteTex.Height;
-            float bx = xCenter - tw / 2f, by = y;
-            float o = 1.5f;
-
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx - o, by,     tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx + o, by,     tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx,     by - o, tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx,     by + o, tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx - o, by - o, tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx + o, by - o, tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx - o, by + o, tw, th, 20);
-            capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, bx + o, by + o, tw, th, 20);
-
-            capi.Render.Render2DTexturePremultipliedAlpha(whiteTex.TextureId, bx, by, tw, th, 21);
+            if (black != null && black.TextureId != 0)
+            {
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx - o, y,     tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx + o, y,     tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx, y - o,     tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx, y + o,     tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx - o, y - o, tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx + o, y - o, tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx - o, y + o, tw, th, 20);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, bx + o, y + o, tw, th, 20);
+            }
+            capi.Render.Render2DTexturePremultipliedAlpha(white.TextureId, bx, y, tw, th, 21);
         }
 
-        // utils
-        static int CountTrue(List<bool> arr, int from = 0, int toExclusive = int.MaxValue)
-        {
-            int end = Math.Min(arr.Count, toExclusive);
-            int c = 0; for (int i = from; i < end; i++) if (arr[i]) c++; return c;
-        }
-        static double Hud2Dist(in Vec3d a, in Vec3d b)
-        {
-            double dx = a.X - b.X, dz = a.Z - b.Z; return Math.Sqrt(dx * dx + dz * dz);
-        }
-        static double Hud3Dist(in Vec3d a, in Vec3d b)
-        {
-            double dx = a.X - b.X, dy = a.Y - b.Y, dz = a.Z - b.Z;
-            return Math.Sqrt(dx * dx + dy * dy + dz * dz);
-        }
-        Vec3d AbsToHud3(double absX, double absY, double absZ)
-        {
-            var sp = capi.World.DefaultSpawnPosition;
-            return new Vec3d(absX - sp.X, absY, absZ - sp.Z);
-        }
-
-        void DrawCardinal(int angleDeg, LoadedTexture mainTex, LoadedTexture blackTex,
+        void DrawCardinal(int angleDeg, LoadedTexture main, LoadedTexture black,
                           float xCenter, float yTop, double headingDeg, float pxPerDeg)
         {
-            if (mainTex == null || mainTex.TextureId == 0) return;
+            if (main == null || main.TextureId == 0) return;
             double rel = AngleDeltaDeg(angleDeg, headingDeg);
             if (Math.Abs(rel) > 60) return;
 
-            float x = xCenter + (float)(rel * pxPerDeg);
-            float tw = mainTex.Width, th = mainTex.Height;
+            float x  = xCenter + (float)(rel * pxPerDeg);
+            float tw = main.Width, th = main.Height;
             float ty = yTop + 4f;
+            const float o = 1.5f;
 
-            if (blackTex != null && blackTex.TextureId != 0)
+            if (black != null && black.TextureId != 0)
             {
-                float o = 1.5f;
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f - o, ty, tw, th, 10f);
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f + o, ty, tw, th, 10f);
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty - o, tw, th, 10f);
-                capi.Render.Render2DTexturePremultipliedAlpha(blackTex.TextureId, x - tw / 2f, ty + o, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, x - tw / 2f - o, ty, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, x - tw / 2f + o, ty, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, x - tw / 2f, ty - o, tw, th, 10f);
+                capi.Render.Render2DTexturePremultipliedAlpha(black.TextureId, x - tw / 2f, ty + o, tw, th, 10f);
             }
-
-            capi.Render.Render2DTexturePremultipliedAlpha(mainTex.TextureId, x - tw / 2f, ty, tw, th, 11f);
+            capi.Render.Render2DTexturePremultipliedAlpha(main.TextureId, x - tw / 2f, ty, tw, th, 11f);
         }
 
         void DrawRectWithOutline(float x, float y, float w, float h, int color, int outline, float o)
@@ -410,18 +443,28 @@ namespace NavMod
             capi.Render.RenderRectangle(x, y, 0f, w, h, color);
         }
 
+        // ── Math utils ───────────────────────────────────────────────────────
+
+        static int CountTrue(List<bool> arr, int from = 0, int toExclusive = int.MaxValue)
+        {
+            int end = Math.Min(arr.Count, toExclusive), c = 0;
+            for (int i = from; i < end; i++) if (arr[i]) c++;
+            return c;
+        }
+
         static double Normalize360(double a) { a %= 360.0; if (a < 0) a += 360.0; return a; }
-        static int Modulo(int a, int n) { int r = a % n; return r < 0 ? r + n : r; }
-        static double AngleDeltaDeg(double a, double b) { double d = (a - b + 540.0) % 360.0 - 180.0; return d; }
+        static int    Modulo(int a, int n)   { int r = a % n; return r < 0 ? r + n : r; }
+        static double AngleDeltaDeg(double a, double b) => (a - b + 540.0) % 360.0 - 180.0;
 
         public double RenderOrder => 0.9;
-        public int RenderRange => 9999;
+        public int    RenderRange => 9999;
 
         public void Dispose()
         {
             nTex?.Dispose(); eTex?.Dispose(); sTex?.Dispose(); wTex?.Dispose();
             nTexBlack?.Dispose(); eTexBlack?.Dispose(); sTexBlack?.Dispose(); wTexBlack?.Dispose();
-            hudTopWhite?.Dispose(); hudTopBlack?.Dispose(); hudBotWhite?.Dispose(); hudBotBlack?.Dispose();
+            hudTopWhite?.Dispose(); hudTopBlack?.Dispose();
+            hudBotWhite?.Dispose(); hudBotBlack?.Dispose();
         }
     }
 }
