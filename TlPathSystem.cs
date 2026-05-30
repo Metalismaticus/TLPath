@@ -47,12 +47,16 @@ namespace NavMod
                         {
                             // FIX #9: parse as double
                             double x = 0, z = 0;
-                            if (args.Length >= 2 &&
-                                double.TryParse(args.PopWord(), System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo.InvariantCulture, out x) &&
-                                double.TryParse(args.PopWord(), System.Globalization.NumberStyles.Float,
-                                    System.Globalization.CultureInfo.InvariantCulture, out z))
-                            { /* parsed */ }
+                            bool parsed = args.Length >= 2
+                                && double.TryParse(args.PopWord(), System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out x)
+                                && double.TryParse(args.PopWord(), System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out z);
+                            if (!parsed)
+                            {
+                                capi.ShowChatMessage("[tl] Usage: .tlpath find <x> <z>");
+                                return;
+                            }
                             svc.FindRouteTo(x, z);
                             svc.AddToHistory((int)Math.Round(x), (int)Math.Round(z));
                             return;

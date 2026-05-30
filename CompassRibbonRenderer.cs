@@ -52,9 +52,17 @@ namespace NavMod
         public double ReachDistBlocks = 1;
         public double FinalReachHud   = 10;
 
-        // ── TL progress (read from RoutePos, not a separate counter) ────────
-        int TotalTeleports  => CountTrue(isTeleportEdge);
-        int PassedTeleports => CountTrue(isTeleportEdge, 0, Math.Min(RoutePos, isTeleportEdge.Count));
+        // ── TL progress ────────────────────────────────────────────────────
+        // Both values are controlled directly by TlPathService: passedTpValue counts
+        // actual forward TL crossings (decremented on backward TL), totalTpValue is
+        // a ratcheted max so the denominator never decreases mid-route.
+        // Inferring "passed" from RoutePos was unstable — Dijkstra finding a different
+        // path on recalc could spike the displayed count.
+        int passedTpValue;
+        int totalTpValue;
+        int CurrentRouteTotalTp => CountTrue(isTeleportEdge);
+        int TotalTeleports  => totalTpValue > 0 ? totalTpValue : CurrentRouteTotalTp;
+        int PassedTeleports => passedTpValue;
 
         // ── Fonts ───────────────────────────────────────────────────────────
         readonly TextTextureUtil ttu;
@@ -136,10 +144,12 @@ namespace NavMod
 
         // ── Route setup ─────────────────────────────────────────────────────
 
-        public void SetRoute3(List<Vec3d> absPoints, List<bool> tlEdgeFlags)
+        public void SetRoute3(List<Vec3d> absPoints, List<bool> tlEdgeFlags,
+                              int origTotal = 0, int doneOffset = 0)
         {
             routeAbs.Clear(); routeHud.Clear(); isTeleportEdge.Clear();
             RoutePos = 0; hasHudTarget = false; TargetX = TargetZ = null;
+            totalTpValue = origTotal; passedTpValue = doneOffset;
             lastTopLine = null; lastBotLine = null; // FIX #11: invalidate cache
 
             if (absPoints != null) routeAbs.AddRange(absPoints);
@@ -185,42 +195,28 @@ namespace NavMod
             lastBotLine      = null;
         }
 
+        // Service-driven TL progress: TlPathService is the source of truth for both values
+        // (it tracks passedTlCount on TL events and ratchets routeTotalTp in BuildRoute).
+        // The renderer just stores what it's told; the Max() below is a defensive clamp
+        // to ensure total >= passed even if a buggy caller passes inconsistent values.
+        public void SetTpProgress(int passed, int total)
+        {
+            passedTpValue = Math.Max(0, passed);
+            totalTpValue  = Math.Max(passedTpValue, total);
+            lastTopLine = null;
+        }
+
         public void ClearRoute()
         {
             routeAbs.Clear(); routeHud.Clear(); isTeleportEdge.Clear();
             RoutePos = 0; hasHudTarget = false; TargetX = TargetZ = null;
+            passedTpValue = 0; totalTpValue = 0;
             lastTopLine = null; lastBotLine = null;
         }
 
         // Keep backward-compat names used in TlPathService
         public void ClearTargetsQueue() => ClearRoute();
         public void SetTarget(double? x, double? z) { TargetX = x; TargetZ = z; }
-
-        // ── Planned TL helpers (used by TlPathService tick) ─────────────────
-
-        public bool TryGetPlannedTeleportPair(out Vec3d entryHud, out Vec3d exitHud)
-        {
-            entryHud = null; exitHud = null;
-            if (RoutePos < routeHud.Count &&
-                RoutePos < isTeleportEdge.Count && isTeleportEdge[RoutePos] &&
-                RoutePos + 1 < routeHud.Count)
-            {
-                entryHud = routeHud[RoutePos];
-                exitHud  = routeHud[RoutePos + 1];
-                return true;
-            }
-            return false;
-        }
-
-        public bool AdvancePastTeleportPair()
-        {
-            if (RoutePos < isTeleportEdge.Count && isTeleportEdge[RoutePos] && RoutePos + 1 < routeAbs.Count)
-            {
-                AdvanceBy(2);
-                return true;
-            }
-            return false;
-        }
 
         // Backward compat
         public void SetTargetsQueue(IEnumerable<Vec2d> points)
@@ -267,11 +263,12 @@ namespace NavMod
             double threshold = isLast ? FinalReachHud : ReachDistBlocks;
             if (d > threshold) return;
 
-            // Skip TL exit automatically
+            // On TL edge, do NOT advance here — wait for actual teleport (jump-detect or touch in TlPathService).
+            // Pre-skipping a TL pair before the player teleports causes the compass to change targets prematurely.
             if (RoutePos < isTeleportEdge.Count && isTeleportEdge[RoutePos])
-                AdvanceBy(2);
-            else
-                AdvanceBy(1);
+                return;
+
+            AdvanceBy(1);
         }
 
         // ── Render ──────────────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-#nullable disable
+﻿#nullable disable
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -56,6 +56,14 @@ namespace NavMod
         public static string BtnClearHist => En("Clear history", "Очистить");
 
         public static string LblWalk     => En("Walk radius (game units):", "Радиус ходьбы (ед.):");
+        public static string LblSource    => En("GeoJSON source:", "Источник GeoJSON:");
+        public static string SrcUrl      => "URL";
+        public static string SrcWaypointer => "Waypointer";
+        public static string WpFound     => En("translocators.geojson found", "translocators.geojson найден");
+        public static string WpMissing      => En("file not found (no TL discovered yet)", "файл не найден (TL ещё не найдены)");
+        public static string WpDescription  => En("Auto-saves discovered translocators to GeoJSON.", "Автосохранение найденных трансляторов в GeoJSON.");
+        public static string WpModPage      => En("Mod page", "Страница мода");
+        public static string WpNotInstalled => En("(not installed)", "(не установлен)");
         public static string LblUrl      => En("GeoJSON URL:", "Ссылка GeoJSON:");
         public static string LblIdle     => En("Compass when idle:", "Компас без маршрута:");
         public static string LblLang     => En("Language:", "Язык:");
@@ -95,7 +103,7 @@ namespace NavMod
         // Wider window to fit Russian labels comfortably
         const double W      = 680;
         const double H      = 530;
-        const double TAB_H  = 30;
+        const double TAB_H  = 25;   // VS standard horizontal tab strip height
         const double BODY_Y = 62;
         const double BODY_H = H - BODY_Y - 10;
 
@@ -134,25 +142,22 @@ namespace NavMod
 
         void Compose()
         {
-            var dlgBounds = ElementBounds.Fixed(EnumDialogArea.CenterMiddle, 0, 0, W, H);
-            var bgBounds  = ElementBounds.Fixed(0, 0, W, H);
-            double tabW   = W / TabLabels.Length;
+            var dlgBounds   = ElementBounds.Fixed(EnumDialogArea.CenterMiddle, 0, 0, W, H);
+            var bgBounds    = ElementBounds.Fixed(0, 0, W, H);
+            var insetBounds = ElementBounds.Fixed(5, BODY_Y - 2, W - 10, BODY_H + 4);
+
+            var tabs = new GuiTab[TabLabels.Length];
+            for (int i = 0; i < TabLabels.Length; i++)
+                tabs[i] = new GuiTab { Name = TabLabels[i], DataInt = i };
 
             var comp = capi.Gui
                 .CreateCompo("tlpath-main", dlgBounds)
-                .AddDialogBG(bgBounds, true, 0.95f)
-                .AddDialogTitleBar("TLPath Navigator", () => TryClose());
-
-            for (int i = 0; i < TabLabels.Length; i++)
-            {
-                int idx = i;
-                comp.AddButton(TabLabels[i],
-                    () => { activeTab = idx; Recompose(); return true; },
-                    ElementBounds.Fixed(i * tabW, 28, tabW - 2, TAB_H),
-                    CairoFont.WhiteSmallText(),
-                    activeTab == i ? EnumButtonStyle.Normal : EnumButtonStyle.Small,
-                    "tab-" + i);
-            }
+                .AddDialogBG(bgBounds, true)
+                .AddDialogTitleBar("TLPath Navigator", () => TryClose())
+                .AddHorizontalTabs(tabs, ElementBounds.Fixed(0, 31, W, TAB_H),
+                    tabIdx => { activeTab = tabIdx; Recompose(); },
+                    CairoFont.WhiteSmallText(), CairoFont.WhiteSmallText(), "maintabs")
+                .AddInset(insetBounds);
 
             var body = ElementBounds.Fixed(0, BODY_Y, W, BODY_H);
 
@@ -166,6 +171,8 @@ namespace NavMod
             }
 
             SingleComposer = comp.Compose();
+
+            SingleComposer.GetHorizontalTabs("maintabs").activeElement = activeTab;
 
             SetInput("input-x",       inputX);
             SetInput("input-z",       inputZ);
@@ -533,15 +540,70 @@ namespace NavMod
             }, ElementBounds.Fixed(x + lw + fw + 16, y, 90, 30), EnumButtonStyle.Small, "st-walk");
             y += rh;
 
-            // ── GeoJSON URL ──────────────────────────────────────────────────
-            comp.AddStaticText(L.LblUrl, CairoFont.WhiteSmallText(),
+            // ── GeoJSON source ────────────────────────────────────────────────
+            comp.AddStaticText(L.LblSource, CairoFont.WhiteSmallText(),
                 ElementBounds.Fixed(x, y + 6, lw, 24));
-            comp.AddTextInput(ElementBounds.Fixed(x + lw + 8, y, fw, 30),
-                v => inputUrl = v, CairoFont.WhiteSmallText(), "input-url");
-            comp.AddSmallButton(L.BtnSet, () => { svc.SetRemoteUrl(inputUrl); return true; },
-                ElementBounds.Fixed(x + lw + fw + 16, y, 90, 30), EnumButtonStyle.Small, "st-url");
+            bool isUrl       = svc.GetSource() == GeoSource.Url;
+            bool wpInstalled = svc.IsWaypointerInstalled();
+            comp.AddSmallButton(L.SrcUrl, () => { svc.SetSource(GeoSource.Url); Recompose(); return true; },
+                ElementBounds.Fixed(x + lw + 8, y, 60, 30),
+                isUrl ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "st-src-url");
+            comp.AddSmallButton(L.SrcWaypointer, () =>
+            {
+                if (!wpInstalled)
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        { FileName = "https://mods.vintagestory.at/waypointer", UseShellExecute = true });
+                else { svc.SetSource(GeoSource.Waypointer); Recompose(); }
+                return true;
+            }, ElementBounds.Fixed(x + lw + 76, y, 120, 30),
+               (wpInstalled && !isUrl) ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "st-src-wp");
+            if (!wpInstalled)
+            {
+                var niFont = CairoFont.WhiteSmallText().WithFontSize(12);
+                niFont.Color = new double[] { 1.0, 0.5, 0.2, 1.0 };
+                comp.AddStaticText(L.WpNotInstalled, niFont,
+                    ElementBounds.Fixed(x + lw + 204, y + 8, 200, 20));
+            }
             y += rh;
 
+            // ── URL field (URL mode) or Waypointer info (Waypointer mode) ────
+            if (isUrl)
+            {
+                comp.AddStaticText(L.LblUrl, CairoFont.WhiteSmallText(),
+                    ElementBounds.Fixed(x, y + 6, lw, 24));
+                comp.AddTextInput(ElementBounds.Fixed(x + lw + 8, y, fw, 30),
+                    v => inputUrl = v, CairoFont.WhiteSmallText(), "input-url");
+                comp.AddSmallButton(L.BtnSet, () => { svc.SetRemoteUrl(inputUrl); return true; },
+                    ElementBounds.Fixed(x + lw + fw + 16, y, 90, 30), EnumButtonStyle.Small, "st-url");
+                y += rh;
+            }
+            else
+            {
+                comp.AddStaticText(L.WpDescription,
+                    CairoFont.WhiteSmallText().WithFontSize(13),
+                    ElementBounds.Fixed(x, y, W - 56, 20));
+                y += 28;
+
+                string worldKey = "world-" + svc.GetWorldKey();
+                bool wpFound    = svc.WaypointerFileExists();
+                var statusFont  = CairoFont.WhiteSmallText().WithFontSize(13);
+                statusFont.Color = wpFound
+                    ? new double[] { 0.3, 0.9, 0.3, 1.0 }
+                    : new double[] { 1.0, 0.6, 0.2, 1.0 };
+                comp.AddStaticText(worldKey, CairoFont.WhiteSmallText(),
+                    ElementBounds.Fixed(x, y, W - 56, 20));
+                comp.AddStaticText(wpFound ? L.WpFound : L.WpMissing, statusFont,
+                    ElementBounds.Fixed(x, y + 22, W - 56, 18));
+                y += 46;
+
+                comp.AddSmallButton(L.WpModPage, () =>
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        { FileName = "https://mods.vintagestory.at/waypointer", UseShellExecute = true });
+                    return true;
+                }, ElementBounds.Fixed(x, y, 120, 28), EnumButtonStyle.Small, "st-wp-page");
+                y += 36;
+            }
             // ── Idle compass ─────────────────────────────────────────────────
             comp.AddStaticText(L.LblIdle, CairoFont.WhiteSmallText(),
                 ElementBounds.Fixed(x, y + 6, lw, 24));
@@ -564,12 +626,12 @@ namespace NavMod
             bool isEn = L.Lang == GuiLang.English;
             comp.AddSmallButton("English", () =>
             {
-                L.Lang = GuiLang.English; Recompose(); return true;
+                svc.SetLanguage(GuiLang.English); Recompose(); return true;
             }, ElementBounds.Fixed(x + lw + 8, y, 80, 30),
                isEn ? EnumButtonStyle.Normal : EnumButtonStyle.Small, "st-en");
             comp.AddSmallButton("Русский", () =>
             {
-                L.Lang = GuiLang.Russian; Recompose(); return true;
+                svc.SetLanguage(GuiLang.Russian); Recompose(); return true;
             }, ElementBounds.Fixed(x + lw + 96, y, 80, 30),
                isEn ? EnumButtonStyle.Small : EnumButtonStyle.Normal, "st-ru");
             y += rh;
